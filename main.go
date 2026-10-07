@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"regexp"
+	"sort"
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
@@ -49,6 +50,12 @@ func nodesByKind(ctx context.Context, k8s client.Client) (map[string][]node, err
 		byKind[parsed.Kind] = append(byKind[parsed.Kind], *parsed)
 	}
 
+	for _, group := range byKind {
+		sort.SliceStable(group, func(i, j int) bool {
+			return group[i].Node.CreationTimestamp.After(group[j].Node.CreationTimestamp.Time)
+		})
+	}
+
 	return byKind, nil
 }
 
@@ -60,33 +67,21 @@ func zombieNodes(byKind map[string][]node) []node {
 			continue
 		}
 
-		readyIndex := -1
-		readyCount := 0
-		names := make([]string, 0, len(group))
-		for i, candidate := range group {
-			names = append(names, candidate.Node.Name)
-			for _, condition := range candidate.Node.Status.Conditions {
-				if condition.Type == corev1.NodeReady && condition.Status == corev1.ConditionTrue {
-					readyIndex = i
-					readyCount++
-					break
-				}
+		newest := group[0]
+		ready := false
+		for _, condition := range newest.Node.Status.Conditions {
+			if condition.Type == corev1.NodeReady && condition.Status == corev1.ConditionTrue {
+				ready = true
+				break
 			}
 		}
-
-		if readyCount > 1 {
-			slog.Warn("skipping cleanup: multiple Ready nodes for kind", "kind", kind, "ready_count", readyCount, "nodes", names)
+		if !ready {
+			slog.Info("waiting for newest node to be Ready", "kind", kind, "node", newest.Node.Name)
 			continue
 		}
-		if readyCount == 0 {
-			slog.Info("waiting for a Ready replacement", "kind", kind, "nodes", names)
-			continue
-		}
-		for i, candidate := range group {
-			if i != readyIndex {
-				slog.Info("stale node selected for cleanup", "kind", kind, "node", candidate.Node.Name, "replacement", group[readyIndex].Node.Name)
-				others = append(others, candidate)
-			}
+		for _, candidate := range group[1:] {
+			slog.Info("stale node selected for cleanup", "kind", kind, "node", candidate.Node.Name, "replacement", newest.Node.Name)
+			others = append(others, candidate)
 		}
 	}
 	return others
