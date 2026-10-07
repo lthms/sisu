@@ -42,6 +42,9 @@ func nodesByKind(ctx context.Context, k8s client.Client) (map[string][]node, err
 
 	byKind := make(map[string][]node)
 	for i := range nodes.Items {
+		if !nodes.Items[i].DeletionTimestamp.IsZero() {
+			continue
+		}
 		parsed, err := New(&nodes.Items[i])
 		if err != nil {
 			slog.Warn("ignoring node with unrecognized name", "node", nodes.Items[i].Name)
@@ -96,6 +99,9 @@ func (n *node) deleteVolumeAttachments(ctx context.Context, k8s client.Client) e
 	for i := range attachments.Items {
 		attachment := &attachments.Items[i]
 		if attachment.Spec.NodeName != n.Node.Name {
+			continue
+		}
+		if !attachment.DeletionTimestamp.IsZero() {
 			continue
 		}
 		slog.Info("requesting volume attachment deletion", "node", n.Node.Name, "attachment", attachment.Name)
@@ -175,7 +181,15 @@ func main() {
 		os.Exit(1)
 	}
 
-	mgr, err := manager.New(cfg, manager.Options{})
+	mgr, err := manager.New(cfg, manager.Options{
+		Client: client.Options{
+			Cache: &client.CacheOptions{
+				// Keep watches cached, but read cleanup targets directly from
+				// the API server to observe accepted deletions on the next scan.
+				DisableFor: []client.Object{&corev1.Node{}, &storagev1.VolumeAttachment{}},
+			},
+		},
+	})
 	if err != nil {
 		slog.Error("could not create a manager", "err", err)
 		os.Exit(1)
