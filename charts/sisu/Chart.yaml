@@ -1,0 +1,7 @@
+apiVersion: v2
+name: sisu
+description: Removes superseded Raya nodes and their volume attachments.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+
