@@ -2,11 +2,14 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"regexp"
 
+	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -14,6 +17,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	crlog "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/manager/signals"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -22,6 +26,12 @@ import (
 
 var agentRegexp = regexp.MustCompile(`^agent-(0|[1-9][0-9]*)-[0-9a-f]{8}$`)
 var controllerRegexp = regexp.MustCompile(`^control-plane-[0-9a-f]{8}$`)
+
+func configureLogging(output io.Writer, level slog.Level) {
+	handler := slog.NewJSONHandler(output, &slog.HandlerOptions{Level: level})
+	slog.SetDefault(slog.New(handler))
+	crlog.SetLogger(logr.FromSlogHandler(handler))
+}
 
 func nodesByKind(ctx context.Context, k8s client.Client) (map[string][]node, error) {
 	var nodes corev1.NodeList
@@ -33,6 +43,7 @@ func nodesByKind(ctx context.Context, k8s client.Client) (map[string][]node, err
 	for i := range nodes.Items {
 		parsed, err := New(&nodes.Items[i])
 		if err != nil {
+			slog.Warn("ignoring node with unrecognized name", "node", nodes.Items[i].Name)
 			continue
 		}
 		byKind[parsed.Kind] = append(byKind[parsed.Kind], *parsed)
@@ -45,12 +56,15 @@ func zombieNodes(byKind map[string][]node) []node {
 	var others []node
 	for kind, group := range byKind {
 		if len(group) < 2 {
+			slog.Debug("no duplicate nodes for kind", "kind", kind)
 			continue
 		}
 
 		readyIndex := -1
 		readyCount := 0
+		names := make([]string, 0, len(group))
 		for i, candidate := range group {
+			names = append(names, candidate.Node.Name)
 			for _, condition := range candidate.Node.Status.Conditions {
 				if condition.Type == corev1.NodeReady && condition.Status == corev1.ConditionTrue {
 					readyIndex = i
@@ -61,14 +75,16 @@ func zombieNodes(byKind map[string][]node) []node {
 		}
 
 		if readyCount > 1 {
-			slog.Error("multiple Ready nodes for kind", "kind", kind, "ready_count", readyCount)
+			slog.Warn("skipping cleanup: multiple Ready nodes for kind", "kind", kind, "ready_count", readyCount, "nodes", names)
 			continue
 		}
 		if readyCount == 0 {
+			slog.Info("waiting for a Ready replacement", "kind", kind, "nodes", names)
 			continue
 		}
 		for i, candidate := range group {
 			if i != readyIndex {
+				slog.Info("stale node selected for cleanup", "kind", kind, "node", candidate.Node.Name, "replacement", group[readyIndex].Node.Name)
 				others = append(others, candidate)
 			}
 		}
@@ -87,28 +103,41 @@ func (n *node) deleteVolumeAttachments(ctx context.Context, k8s client.Client) e
 		if attachment.Spec.NodeName != n.Node.Name {
 			continue
 		}
-		if err := k8s.Delete(ctx, attachment); err != nil && !apierrors.IsNotFound(err) {
-			return fmt.Errorf("could not delete volume attachment %q for node %q: %w", attachment.Name, n.Node.Name, err)
+		slog.Info("requesting volume attachment deletion", "node", n.Node.Name, "attachment", attachment.Name)
+		if err := k8s.Delete(ctx, attachment); err != nil {
+			if !apierrors.IsNotFound(err) {
+				return fmt.Errorf("could not delete volume attachment %q for node %q: %w", attachment.Name, n.Node.Name, err)
+			}
+			slog.Info("volume attachment already absent", "node", n.Node.Name, "attachment", attachment.Name)
+		} else {
+			slog.Info("volume attachment deletion accepted", "node", n.Node.Name, "attachment", attachment.Name)
 		}
 	}
 
 	return nil
 }
 
-// RESP: The reconciler now calls deleteZombies for every node event, including
-// deletion events. Cleanup errors are returned to trigger retries.
+// Cleanup errors are returned to controller-runtime for logging and retries.
 func deleteZombies(ctx context.Context, k8s client.Client) error {
 	byKind, err := nodesByKind(ctx, k8s)
 	if err != nil {
 		return err
 	}
 
-	for _, zombie := range zombieNodes(byKind) {
+	zombies := zombieNodes(byKind)
+	slog.Debug("node scan completed", "kinds", len(byKind), "stale_nodes", len(zombies))
+	for _, zombie := range zombies {
 		if err := zombie.deleteVolumeAttachments(ctx, k8s); err != nil {
 			return err
 		}
-		if err := k8s.Delete(ctx, zombie.Node); err != nil && !apierrors.IsNotFound(err) {
-			return fmt.Errorf("could not delete zombie node %q: %w", zombie.Node.Name, err)
+		slog.Info("requesting stale node deletion", "node", zombie.Node.Name, "kind", zombie.Kind)
+		if err := k8s.Delete(ctx, zombie.Node); err != nil {
+			if !apierrors.IsNotFound(err) {
+				return fmt.Errorf("could not delete zombie node %q: %w", zombie.Node.Name, err)
+			}
+			slog.Info("stale node already absent", "node", zombie.Node.Name)
+		} else {
+			slog.Info("stale node deletion accepted", "node", zombie.Node.Name, "kind", zombie.Kind)
 		}
 	}
 
@@ -139,9 +168,16 @@ func New(k8sNode *corev1.Node) (*node, error) {
 }
 
 func main() {
+	var level slog.Level
+	flag.TextVar(&level, "log-level", slog.LevelInfo, "Log level: debug, info, warn, or error")
+	flag.Parse()
+	configureLogging(os.Stderr, level)
+	slog.Info("starting sisu", "log_level", level.String())
+
 	cfg, err := config.GetConfig()
 	if err != nil {
-		panic(err)
+		slog.Error("could not load Kubernetes configuration", "err", err)
+		os.Exit(1)
 	}
 
 	mgr, err := manager.New(cfg, manager.Options{})
@@ -153,7 +189,8 @@ func main() {
 	k8s := mgr.GetClient()
 
 	ctrl, err := controller.New("sisu-controller", mgr, controller.Options{
-		Reconciler: reconcile.Func(func(ctxt context.Context, _ reconcile.Request) (reconcile.Result, error) {
+		Reconciler: reconcile.Func(func(ctxt context.Context, request reconcile.Request) (reconcile.Result, error) {
+			slog.Debug("reconciling node event", "node", request.Name)
 			return reconcile.Result{}, deleteZombies(ctxt, k8s)
 		}),
 	})
@@ -173,4 +210,5 @@ func main() {
 		slog.Error("manager stopped", "err", err)
 		os.Exit(1)
 	}
+	slog.Info("sisu stopped")
 }
